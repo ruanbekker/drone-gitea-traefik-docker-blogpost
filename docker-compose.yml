@@ -1,0 +1,169 @@
+---
+version: '3.8'
+
+services:
+  gitea-traefik:
+    image: traefik:2.4
+    container_name: gitea-traefik
+    restart: unless-stopped
+    volumes:
+      - ./traefik/acme.json:/acme.json
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - public
+    labels:
+      - 'traefik.enable=true'
+      - 'traefik.http.routers.api.rule=Host(`traefik.localdns.xyz`)'
+      - 'traefik.http.routers.api.entrypoints=https'
+      - 'traefik.http.routers.api.service=api@internal'
+      - 'traefik.http.routers.api.tls=true'
+      - 'traefik.http.routers.api.tls.certresolver=letsencrypt'
+    ports:
+      - 80:80
+      - 443:443
+    command:
+      - '--api'
+      - '--providers.docker=true'
+      - '--providers.docker.exposedByDefault=false'
+      - '--entrypoints.http=true'
+      - '--entrypoints.http.address=:80'
+      - '--entrypoints.http.http.redirections.entrypoint.to=https'
+      - '--entrypoints.http.http.redirections.entrypoint.scheme=https'
+      - '--entrypoints.https=true'
+      - '--entrypoints.https.address=:443'
+      - '--certificatesResolvers.letsencrypt.acme.email=you@localdns.xyz'
+      - '--certificatesResolvers.letsencrypt.acme.storage=acme.json'
+      - '--certificatesResolvers.letsencrypt.acme.httpChallenge.entryPoint=http'
+      - '--log=true'
+      - '--log.level=INFO'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+
+  gitea:
+    container_name: gitea
+    image: gitea/gitea:${GITEA_VERSION:-1.14.5}
+    restart: unless-stopped
+    depends_on:
+      gitea-traefik:
+        condition: service_started
+      gitea-cache:
+        condition: service_healthy
+    environment:
+      - APP_NAME="Gitea"
+      - USER_UID=1000
+      - USER_GID=1000
+      - USER=git
+      - RUN_MODE=prod
+      - DOMAIN=git.localdns.xyz
+      - SSH_DOMAIN=git.localdns.xyz
+      - HTTP_PORT=3000
+      - ROOT_URL=https://git.localdns.xyz
+      - SSH_PORT=222
+      - SSH_LISTEN_PORT=22
+      - DB_TYPE=sqlite3
+      - GITEA__cache__ENABLED=true
+      - GITEA__cache__ADAPTER=redis
+      - GITEA__cache__HOST=redis://gitea-cache:6379/0?pool_size=100&idle_timeout=180s
+      - GITEA__cache__ITEM_TTL=24h
+    ports:
+      - "222:22"
+    networks:
+      - public
+    volumes:
+      - ./data/gitea:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gitea.rule=Host(`git.localdns.xyz`)"
+      - "traefik.http.routers.gitea.entrypoints=https"
+      - "traefik.http.routers.gitea.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.gitea.service=gitea-service"
+      - "traefik.http.services.gitea-service.loadbalancer.server.port=3000"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+
+  gitea-cache:
+    container_name: gitea-cache
+    image: redis:6-alpine
+    restart: unless-stopped
+    networks:
+      - public
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+
+  drone:
+    container_name: drone
+    image: drone/drone:${DRONE_VERSION:-2.4}
+    restart: unless-stopped
+    depends_on:
+      gitea:
+        condition: service_started
+    environment:
+      # https://docs.drone.io/server/provider/gitea/
+      - DRONE_DATABASE_DRIVER=sqlite3
+      - DRONE_DATABASE_DATASOURCE=/data/database.sqlite
+      - DRONE_GITEA_SERVER=https://git.localdns.xyz/
+      - DRONE_GIT_ALWAYS_AUTH=false
+      - DRONE_RPC_SECRET=${DRONE_RPC_SECRET}
+      - DRONE_SERVER_PROTO=https
+      - DRONE_SERVER_HOST=ci.localdns.xyz
+      - DRONE_TLS_AUTOCERT=false
+      - DRONE_USER_CREATE=${DRONE_USER_CREATE}
+      - DRONE_GITEA_CLIENT_ID=${DRONE_GITEA_CLIENT_ID}
+      - DRONE_GITEA_CLIENT_SECRET=${DRONE_GITEA_CLIENT_SECRET}
+    ports:
+      - "3001:80"
+      - "9001:9000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.drone.rule=Host(`ci.localdns.xyz`)"
+      - "traefik.http.routers.drone.entrypoints=https"
+      - "traefik.http.routers.drone.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.drone.service=drone-service"
+      - "traefik.http.services.drone-service.loadbalancer.server.port=80"
+    networks:
+      - public
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./drone:/data
+
+  drone-runner:
+    container_name: drone-runner
+    image: drone/drone-runner-docker:${DRONE_RUNNER_VERSION:-1}
+    restart: unless-stopped
+    depends_on:
+      drone:
+        condition: service_started
+    environment:
+      # https://docs.drone.io/runner/docker/installation/linux/
+      # https://docs.drone.io/server/metrics/
+      - DRONE_RPC_PROTO=https
+      - DRONE_RPC_HOST=ci.localdns.xyz
+      - DRONE_RPC_SECRET=${DRONE_RPC_SECRET}
+      - DRONE_RUNNER_NAME="${HOSTNAME}-runner"
+      - DRONE_RUNNER_CAPACITY=2
+      - DRONE_RUNNER_NETWORKS=public
+      - DRONE_DEBUG=false
+      - DRONE_TRACE=false
+    ports:
+      - "3002:3000"
+    networks:
+      - public
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  public:
+    name: public
